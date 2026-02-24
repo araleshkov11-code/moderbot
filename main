@@ -1,0 +1,461 @@
+# -*- coding: utf-8 -*-
+import logging
+import random
+from datetime import datetime, timedelta
+from functools import wraps
+
+from telegram import Update, ChatPermissions
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
+
+# ---------- НАСТРОЙКИ ----------
+BOT_TOKEN = "8508729401:AAFQ3QXGwFEyGZzaRz1h9PUnNZypHTmkztA"          # замените на реальный токен
+WARN_LIMIT = 3                         # лимит предупреждений до автоматического мута
+MUTE_DURATION = 86400                   # длительность мута при превышении лимита (сек)
+ADMIN_IDS = None                        # список ID админов (или None для проверки роли в чате)
+
+# ---------- ЛОГИРОВАНИЕ ----------
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int = None) -> bool:
+    """Проверяет, является ли пользователь администратором чата."""
+    if user_id is None:
+        user_id = update.effective_user.id
+
+    if ADMIN_IDS is not None:
+        return user_id in ADMIN_IDS
+
+    chat_id = update.effective_chat.id
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception as e:
+        logger.error(f"Ошибка проверки прав: {e}")
+        return False
+
+def admin_only(func):
+    """Декоратор, ограничивающий доступ к команде только администраторам."""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await is_admin(update, context):
+            await update.message.reply_text("❌ Эта команда только для администраторов.")
+            return
+        return await func(update, context)
+    return wrapper
+
+def get_warns_key(chat_id, user_id):
+    return f"warns_{chat_id}_{user_id}"
+
+# ---------- АДМИН-КОМАНДЫ ----------
+@admin_only
+async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Замутить пользователя (ответом). /мут [минуты]"""
+    if not update.message.reply_to_message:
+        await update.message.reply_text("⚠️ Ответьте на сообщение пользователя, которого хотите замутить.")
+        return
+
+    user_id = update.message.reply_to_message.from_user.id
+    chat_id = update.effective_chat.id
+
+    duration_minutes = 10
+    if context.args:
+        try:
+            duration_minutes = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат времени. Пример: /мут 30")
+            return
+
+    until_date = datetime.now() + timedelta(minutes=duration_minutes)
+    permissions = ChatPermissions(can_send_messages=False)
+
+    try:
+        await context.bot.restrict_chat_member(chat_id, user_id, permissions, until_date=until_date)
+        await update.message.reply_text(f"🔇 Пользователь замучен на {duration_minutes} мин.")
+    except Exception as e:
+        logger.error(f"Ошибка мута: {e}")
+        await update.message.reply_text("❌ Не удалось замутить. Проверьте права бота.")
+
+@admin_only
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Забанить пользователя (ответом). /бан"""
+    if not update.message.reply_to_message:
+        await update.message.reply_text("⚠️ Ответьте на сообщение пользователя, которого хотите забанить.")
+        return
+
+    user_id = update.message.reply_to_message.from_user.id
+    chat_id = update.effective_chat.id
+
+    try:
+        await context.bot.ban_chat_member(chat_id, user_id)
+        await update.message.reply_text("🚫 Пользователь забанен.")
+    except Exception as e:
+        logger.error(f"Ошибка бана: {e}")
+        await update.message.reply_text("❌ Не удалось забанить. Проверьте права бота.")
+
+@admin_only
+async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выдать предупреждение (ответом). /варн"""
+    if not update.message.reply_to_message:
+        await update.message.reply_text("⚠️ Ответьте на сообщение пользователя, которому хотите выдать предупреждение.")
+        return
+
+    user_id = update.message.reply_to_message.from_user.id
+    chat_id = update.effective_chat.id
+    key = get_warns_key(chat_id, user_id)
+
+    warns = context.bot_data.get(key, 0) + 1
+    context.bot_data[key] = warns
+
+    await update.message.reply_text(f"⚠️ Предупреждение {warns}/{WARN_LIMIT}.")
+
+    if warns >= WARN_LIMIT:
+        until_date = datetime.now() + timedelta(seconds=MUTE_DURATION)
+        permissions = ChatPermissions(can_send_messages=False)
+        try:
+            await context.bot.restrict_chat_member(chat_id, user_id, permissions, until_date=until_date)
+            await update.message.reply_text(f"🔇 Пользователь получил {WARN_LIMIT} предупреждений и замучен на {MUTE_DURATION//3600} ч.")
+            context.bot_data.pop(key, None)
+        except Exception as e:
+            logger.error(f"Ошибка автоматического мута: {e}")
+            await update.message.reply_text("❌ Не удалось замутить, но предупреждение засчитано.")
+
+@admin_only
+async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Снять мут (ответом). /размут"""
+    if not update.message.reply_to_message:
+        await update.message.reply_text("⚠️ Ответьте на сообщение пользователя, с которого снять мут.")
+        return
+
+    user_id = update.message.reply_to_message.from_user.id
+    chat_id = update.effective_chat.id
+
+    permissions = ChatPermissions(
+        can_send_messages=True,
+        can_send_media_messages=True,
+        can_send_polls=True,
+        can_send_other_messages=True,
+        can_add_web_page_previews=True,
+        can_change_info=True,
+        can_invite_users=True,
+        can_pin_messages=True,
+    )
+
+    try:
+        await context.bot.restrict_chat_member(chat_id, user_id, permissions)
+        await update.message.reply_text("🔊 Мут снят.")
+    except Exception as e:
+        logger.error(f"Ошибка снятия мута: {e}")
+        await update.message.reply_text("❌ Не удалось снять мут.")
+
+@admin_only
+async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Разбанить пользователя (ответом). /разбан"""
+    if not update.message.reply_to_message:
+        await update.message.reply_text("⚠️ Ответьте на сообщение пользователя, которого хотите разбанить.")
+        return
+
+    user_id = update.message.reply_to_message.from_user.id
+    chat_id = update.effective_chat.id
+
+    try:
+        await context.bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+        await update.message.reply_text("✅ Пользователь разбанен.")
+    except Exception as e:
+        logger.error(f"Ошибка разбана: {e}")
+        await update.message.reply_text("❌ Не удалось разбанить.")
+
+@admin_only
+async def add_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавить слово в чёрный список. /добавитьслово слово"""
+    if not context.args:
+        await update.message.reply_text("Укажите слово для добавления.\nПример: /добавитьслово спам")
+        return
+
+    word = " ".join(context.args).lower().strip()
+    bad_words = context.bot_data.setdefault("bad_words", set())
+
+    if word in bad_words:
+        await update.message.reply_text(f"Слово «{word}» уже в списке.")
+    else:
+        bad_words.add(word)
+        await update.message.reply_text(f"Слово «{word}» добавлено в список запрещённых.")
+
+@admin_only
+async def remove_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удалить слово из чёрного списка. /удалитьслово слово"""
+    if not context.args:
+        await update.message.reply_text("Укажите слово для удаления.\nПример: /удалитьслово спам")
+        return
+
+    word = " ".join(context.args).lower().strip()
+    bad_words = context.bot_data.get("bad_words", set())
+
+    if word in bad_words:
+        bad_words.remove(word)
+        await update.message.reply_text(f"Слово «{word}» удалено из списка.")
+    else:
+        await update.message.reply_text(f"Слово «{word}» не найдено в списке.")
+
+@admin_only
+async def list_words(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать список запрещённых слов. /слова"""
+    bad_words = context.bot_data.get("bad_words", set())
+    if not bad_words:
+        await update.message.reply_text("Список запрещённых слов пуст.")
+        return
+
+    words_list = "\n".join(sorted(bad_words))
+    await update.message.reply_text(f"📋 Запрещённые слова:\n{words_list}")
+
+# ---------- АВТОУДАЛЕНИЕ СООБЩЕНИЙ ----------
+async def auto_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет сообщения, содержащие запрещённые слова."""
+    if not update.message or not update.message.text:
+        return
+    if update.message.text.startswith("/"):
+        return
+
+    text = update.message.text.lower()
+    bad_words = context.bot_data.get("bad_words", set())
+    if not bad_words:
+        return
+
+    for word in bad_words:
+        if word in text:
+            try:
+                await update.message.delete()
+                logger.info(f"Удалено сообщение от {update.effective_user.id} (слово: {word})")
+            except Exception as e:
+                logger.error(f"Не удалось удалить сообщение: {e}")
+            break
+
+# ---------- ИГРЫ ----------
+async def rps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Игра камень-ножницы-бумага. /кнб камень/ножницы/бумага"""
+    if not context.args:
+        await update.message.reply_text("Выберите: камень, ножницы или бумага.\nПример: /кнб камень")
+        return
+
+    user_choice = context.args[0].lower()
+    if user_choice not in ("камень", "ножницы", "бумага"):
+        await update.message.reply_text("Допустимые варианты: камень, ножницы, бумага.")
+        return
+
+    bot_choice = random.choice(["камень", "ножницы", "бумага"])
+    result = ""
+    if user_choice == bot_choice:
+        result = "Ничья! 🤝"
+    elif (user_choice == "камень" and bot_choice == "ножницы") or \
+         (user_choice == "ножницы" and bot_choice == "бумага") or \
+         (user_choice == "бумага" and bot_choice == "камень"):
+        result = "Вы выиграли! 🎉"
+    else:
+        result = "Бот выиграл! 🤖"
+
+    await update.message.reply_text(f"Ваш выбор: {user_choice}\nБот выбрал: {bot_choice}\n{result}")
+
+async def guess_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начать игру «Угадай число». Бот загадывает число от 1 до 10."""
+    chat_id = update.effective_chat.id
+    number = random.randint(1, 10)
+    context.bot_data[f"guess_{chat_id}"] = number
+    await update.message.reply_text("Я загадал число от 1 до 10. Попробуйте угадать командой /угадай <число>")
+
+async def guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Попытка угадать число. /угадай число"""
+    if not context.args:
+        await update.message.reply_text("Укажите число. Пример: /угадай 5")
+        return
+
+    chat_id = update.effective_chat.id
+    secret = context.bot_data.get(f"guess_{chat_id}")
+    if secret is None:
+        await update.message.reply_text("Сначала начните игру командой /угадай")
+        return
+
+    try:
+        user_guess = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Введите число.")
+        return
+
+    if user_guess == secret:
+        await update.message.reply_text(f"Поздравляю! Вы угадали число {secret}! 🎉")
+        # удаляем загаданное число, чтобы игра завершилась
+        del context.bot_data[f"guess_{chat_id}"]
+    else:
+        hint = "больше" if user_guess < secret else "меньше"
+        await update.message.reply_text(f"Неверно. Загаданное число {hint}.")
+
+# ---------- СИСТЕМА БРАКОВ ----------
+async def propose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Предложить брак пользователю. /предложить @username"""
+    if not update.message.reply_to_message and not context.args:
+        await update.message.reply_text("Ответьте на сообщение пользователя или укажите @username.\nПример: /предложить @durov")
+        return
+
+    # Определяем целевого пользователя
+    if update.message.reply_to_message:
+        target_user = update.message.reply_to_message.from_user
+    else:
+        # Пытаемся извлечь username из аргументов
+        username = context.args[0].lstrip('@')
+        try:
+            # Ищем участника по username (упрощённо, без гарантии)
+            # В реальности лучше использовать get_chat_member, но это сложнее
+            # Для простоты будем считать, что пользователь есть в чате
+            target_user = None
+            async for member in context.bot.get_chat_administrators(update.effective_chat.id):
+                if member.user.username and member.user.username.lower() == username.lower():
+                    target_user = member.user
+                    break
+            if not target_user:
+                # Также можно искать среди обычных участников, но API не позволяет получить полный список без прав.
+                # Поэтому просто создадим объект User с известным ID? Нельзя.
+                await update.message.reply_text("Не удалось найти пользователя. Убедитесь, что он в чате, или ответьте на его сообщение.")
+                return
+        except Exception as e:
+            logger.error(f"Ошибка поиска пользователя: {e}")
+            await update.message.reply_text("Ошибка при поиске пользователя.")
+            return
+
+    proposer = update.effective_user
+    chat_id = update.effective_chat.id
+
+    # Проверяем, не состоит ли кто-то уже в браке
+    marriages = context.bot_data.setdefault("marriages", {})
+    if proposer.id in marriages:
+        await update.message.reply_text("Вы уже состоите в браке. Сначала разведитесь.")
+        return
+    if target_user.id in marriages:
+        await update.message.reply_text("Этот пользователь уже состоит в браке.")
+        return
+    if proposer.id == target_user.id:
+        await update.message.reply_text("Нельзя жениться на самом себе.")
+        return
+
+    # Сохраняем предложение
+    proposals = context.bot_data.setdefault("proposals", {})
+    proposals[target_user.id] = proposer.id
+    await update.message.reply_text(
+        f"💍 {proposer.first_name} предложил(а) брак пользователю {target_user.first_name}.\n"
+        f"Чтобы согласиться, {target_user.first_name}, напишите /согласиться.\n"
+        f"Чтобы отказаться, напишите /отказаться."
+    )
+
+async def accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принять предложение брака. /согласиться"""
+    user_id = update.effective_user.id
+    proposals = context.bot_data.get("proposals", {})
+    if user_id not in proposals:
+        await update.message.reply_text("У вас нет активных предложений брака.")
+        return
+
+    proposer_id = proposals[user_id]
+    marriages = context.bot_data.setdefault("marriages", {})
+    if proposer_id in marriages or user_id in marriages:
+        await update.message.reply_text("Кто-то из вас уже состоит в браке.")
+        del proposals[user_id]
+        return
+
+    # Заключаем брак
+    marriages[proposer_id] = user_id
+    marriages[user_id] = proposer_id
+    del proposals[user_id]
+
+    await update.message.reply_text("💞 Поздравляю! Брак заключён! 💞")
+
+async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отказаться от предложения брака. /отказаться"""
+    user_id = update.effective_user.id
+    proposals = context.bot_data.get("proposals", {})
+    if user_id not in proposals:
+        await update.message.reply_text("У вас нет активных предложений брака.")
+        return
+
+    proposer_id = proposals[user_id]
+    del proposals[user_id]
+    await update.message.reply_text("❌ Вы отказались от брака.")
+
+async def divorce(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Развестись. /развод"""
+    user_id = update.effective_user.id
+    marriages = context.bot_data.get("marriages", {})
+    if user_id not in marriages:
+        await update.message.reply_text("Вы не состоите в браке.")
+        return
+
+    partner_id = marriages[user_id]
+    del marriages[user_id]
+    del marriages[partner_id]
+    await update.message.reply_text("💔 Брак расторгнут.")
+
+async def family(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать информацию о семье. /семья"""
+    user_id = update.effective_user.id
+    marriages = context.bot_data.get("marriages", {})
+    if user_id not in marriages:
+        await update.message.reply_text("Вы не состоите в браке.")
+        return
+
+    partner_id = marriages[user_id]
+    try:
+        partner = await context.bot.get_chat(partner_id)
+        partner_name = partner.first_name
+    except:
+        partner_name = "пользователь"
+
+    await update.message.reply_text(f"💑 Вы в браке с {partner_name}.")
+
+# ---------- ЗАПУСК ----------
+def main():
+    if BOT_TOKEN == "ВАШ_ТОКЕН_БОТА":
+        logger.error("Токен не задан! Отредактируйте переменную BOT_TOKEN в коде.")
+        return
+
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Хранилища
+    application.bot_data["bad_words"] = set()
+    application.bot_data["marriages"] = {}
+    application.bot_data["proposals"] = {}
+
+    # Регистрация команд (русские названия)
+    application.add_handler(CommandHandler("мут", mute))
+    application.add_handler(CommandHandler("бан", ban))
+    application.add_handler(CommandHandler("варн", warn))
+    application.add_handler(CommandHandler("размут", unmute))
+    application.add_handler(CommandHandler("разбан", unban))
+    application.add_handler(CommandHandler("добавитьслово", add_word))
+    application.add_handler(CommandHandler("удалитьслово", remove_word))
+    application.add_handler(CommandHandler("слова", list_words))
+
+    # Игры
+    application.add_handler(CommandHandler("кнб", rps))
+    application.add_handler(CommandHandler("угадай", guess))
+    application.add_handler(CommandHandler(["угадайстарт", "угадай"], guess_start))  # две команды для старта
+
+    # Браки
+    application.add_handler(CommandHandler("предложить", propose))
+    application.add_handler(CommandHandler("согласиться", accept))
+    application.add_handler(CommandHandler("отказаться", reject))
+    application.add_handler(CommandHandler("развод", divorce))
+    application.add_handler(CommandHandler("семья", family))
+
+    # Автоудаление
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_delete))
+
+    logger.info("Бот запущен...")
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
