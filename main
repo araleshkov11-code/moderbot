@@ -442,7 +442,7 @@ def main():
     # Игры
     application.add_handler(CommandHandler("knb", rps))
     application.add_handler(CommandHandler("guess", guess))
-    application.add_handler(CommandHandler(["startguess", "угадай"], guess_start))  # две команды для старта
+
 
     # Браки
     application.add_handler(CommandHandler("marry", propose))
