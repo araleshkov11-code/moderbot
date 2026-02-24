@@ -349,7 +349,7 @@ async def propose(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"💍 {proposer.first_name} предложил(а) брак пользователю {target_user.first_name}.\n"
         f"Чтобы согласиться, {target_user.first_name}, напишите /agree.\n"
-        f"Чтобы отказаться, напишите /отказаться."
+        f"Чтобы отказаться, напишите /deny."
     )
 
 async def accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
